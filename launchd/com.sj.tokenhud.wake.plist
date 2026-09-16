@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sj.tokenhud.wake</string>
+
+  <!-- 절전 깨어남 / 네트워크 복구를 감지해 TokenHUD 를 즉시 갱신시킨다 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__TOKENHUD_DIR__/assets/wake-refresh.sh</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 감시자는 항상 살아있어야 한다 -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/tokenhud-wake.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/tokenhud-wake.log</string>
+</dict>
+</plist>

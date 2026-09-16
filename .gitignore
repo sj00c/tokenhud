@@ -1,0 +1,9 @@
+# 컴파일 산출물 — swiftc 로 각자 빌드한다 (arm64 바이너리를 커밋하지 않는다)
+assets/hudimg
+
+# 에이전트 런타임 상태
+.gjc/
+
+# 로컬 백업
+backups/
+*.bak-*

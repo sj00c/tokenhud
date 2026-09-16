@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sj.tokenhud.swiftbar</string>
+
+  <!-- SwiftBar 본체를 직접 띄운다. 죽으면 launchd 가 다시 올린다. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/SwiftBar.app/Contents/MacOS/SwiftBar</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 비정상 종료 때만 되살린다.
+       SuccessfulExit=false -> 사용자가 메뉴에서 Quit 하면 그대로 둔다.
+       (true 로 두면 종료할 방법이 없어진다) -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- 크래시 루프 시 재시작 간격. 너무 짧으면 CPU 를 태운다. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/tokenhud-swiftbar.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/tokenhud-swiftbar.log</string>
+</dict>
+</plist>
