@@ -18,13 +18,9 @@ export LC_CTYPE="en_US.UTF-8"
 CACHE_DIR="$HOME/.cache/tokenhud"
 [ -d "$CACHE_DIR" ] || mkdir -p "$CACHE_DIR"
 
-# 현재 시각을 한 번만 구한다.
-#
-# bash 3.2(/bin/bash) 에는 $EPOCHSECONDS 가 없어 date 를 써야 한다. 예전엔
-# 필요할 때마다 `$(date +%s)` 를 불러 1회 실행에 13번이나 스폰했다(실측).
-# 한 번의 실행 안에서 몇 백 밀리초 차이는 의미가 없고, 오히려 같은 기준시각을
-# 써야 계산이 서로 어깤나지 않는다(예: 남은시간 계산 중 초가 넘어가는 경우).
-# 표시용 로컬 시각도 같은 date 한 번에서 UTC 오프셋을 받아 산술로 만든다.
+# 현재 시각은 실행당 한 번만 구해 모든 계산의 기준으로 쓴다.
+# bash 3.2(/bin/bash) 에는 $EPOCHSECONDS 가 없어 date 가 필요하다. 표시용 로컬 시각은
+# 같은 date 에서 받은 UTC 오프셋으로 산술 계산한다.
 read -r NOW TZ_OFF <<<"$(date '+%s %z')"
 TZ_SEC=$(( 10#${TZ_OFF:1:2} * 3600 + 10#${TZ_OFF:3:2} * 60 ))
 [ "${TZ_OFF:0:1}" = "-" ] && TZ_SEC=$(( -TZ_SEC ))
@@ -104,14 +100,14 @@ in_backoff() {   # in_backoff <claude|codex>
   [ "${until%.*}" -gt "$NOW" ] 2>/dev/null
 }
 
-# backoff 가 언제 풀리는지 사람이 읽게. 드롭다운에만 쓰이는 느린 경로라
-# 서브쉘 쓰는 human_left 를 그대로 빌려쓴다.
+# backoff 가 언제 풀리는지 사람이 읽게.
 backoff_left() {   # backoff_left <claude|codex>
   local f="$CACHE_DIR/.$1_backoff_until" until
   [ -f "$f" ] || { echo "잠시 후 자동 복구"; return; }
   until=$(<"$f") ; until="${until:-0}" ; until="${until%.*}"
   [ "$until" -gt "$NOW" ] 2>/dev/null || { echo "잠시 후 자동 복구"; return; }
-  echo "$(human_left $(( until - NOW ))) 뒤 재시도"
+  human_left_set $(( until - NOW ))
+  echo "$LEFT 뒤 재시도"
 }
 set_backoff() {   # set_backoff <claude|codex> <초>
   local secs="${2:-300}"
@@ -150,12 +146,12 @@ IDLE_SKIP=0
 
 fresh() {
   local f="$CACHE_DIR/$1.json" m
-  # backoff 중에는 캐시가 낙았어도 '신선한 셈' 치고 조회를 막는다.
+  # backoff 중에는 캐시가 낡았어도 '신선한 셈' 치고 조회를 막는다.
   #
   # 단, 사용자가 메뉴에서 직접 "지금 강제 갱신"을 누른 경우는 예외다.
   # 예전엔 backoff 가 bust 보다 무조건 우선이라, 누르면 표식만 소모되고
   # 조회는 안 도는 무반응 버튼이 됐다(재로그인 직후가 정확히 이 상황 —
-  # 토큰은 멀줦한데 직전 429 로 걸린 backoff 가 남아 몇 분간 옆날 값을 보였다).
+  # 토큰은 멀쩡한데 직전 429 로 걸린 backoff 가 남아 몇 분간 옛날 값을 보였다).
   # 사용자가 명시적으로 누른 1회성 요청은 backoff 를 끊고 통과시킨다.
   # 자동 주기(BUSTED=0)는 예전대로 backoff 를 존중한다.
   if in_backoff "$1"; then
@@ -165,6 +161,8 @@ fresh() {
   [ -f "$f" ] || return 1
   m=$(stat -f %m "$f" 2>/dev/null) || return 1
   printf -v "MT_$1" '%s' "$m"
+  # 다른 실행이 조회 중이면 캐시만 그린다(중복 호출 방지).
+  [ "$NO_FETCH" = 1 ] && return 0
   # 한 공급자의 주기가 끝났으면(ROUND_DUE) 다른 쪽도 주기의 절반을 넘겼을 때 같이
   # 받는다. 둔의 주기가 어긋나면 TTL 마다 전체 경로가 두 번 돈다. 공급자별 호출 빈도는
   # 그대로(TTL 당 1회)이고, 오류 상태(스냅샷 없음)에서는 맞추지 않는다.
@@ -185,10 +183,8 @@ fresh() {
 # 리셋이 안 지났으면 캐시값은 여전히 유효한 하한이다.
 # -> 리셋 전이면 '유효', 리셋이 지났으면 '못 믿음'.
 cache_still_valid() {   # cache_still_valid <claude|codex>
-  local f="$CACHE_DIR/$1.json" now
+  local f="$CACHE_DIR/$1.json" resets
   [ -s "$f" ] || return 1
-  now=$NOW
-  local resets
   if [ "$1" = "claude" ]; then
     # ISO8601 -> epoch (가장 이른 리셋 = 5시간 창)
     resets=$(jq -r '[.five_hour.resets_at, .seven_day.resets_at]
@@ -201,44 +197,27 @@ cache_still_valid() {   # cache_still_valid <claude|codex>
     resets=${resets%.*}
   fi
   [ -n "$resets" ] || return 1
-  [ "$now" -lt "$resets" ]
+  [ "$NOW" -lt "$resets" ]
 }
 
 # ── 유틸 ──────────────────────────────────────────────────────────────
-# 남은 시간 사람이 읽게: 3720 -> "1h 2m"
-human_left() {
-  local s=$1
-  [ -z "$s" ] || [ "$s" = "null" ] && { echo "-"; return; }
-  s=${s%.*}
-  [ "$s" -le 0 ] 2>/dev/null && { echo "곳"; return; }
-  local d=$((s/86400)) h=$((s%86400/3600)) m=$((s%3600/60))
-  if   [ $d -gt 0 ]; then echo "${d}d ${h}h"
-  elif [ $h -gt 0 ]; then echo "${h}h ${m}m"
-  else                    echo "${m}m"; fi
-}
-
-# human_left 의 서브셸 없는 판. 행 렌더링은 매분 도는 경로라 여기어만 쓴다.
-# (cache_age 처럼 가끔 불리는 곳은 읽기 쉬운 원본 human_left 를 그대로 쓴다)
+# 남은 시간 사람이 읽게: 3720 -> "1h 2m". 서브셸 없이 전역 LEFT 로 돌려준다.
 human_left_set() {   # human_left_set <초> -> $LEFT
   local s=$1
   if [ -z "$s" ] || [ "$s" = "null" ]; then LEFT="-"; return; fi
   s=${s%.*}
-  if [ "$s" -le 0 ] 2>/dev/null; then LEFT="곳"; return; fi
+  if [ "$s" -le 0 ] 2>/dev/null; then LEFT="곧"; return; fi
   local d=$((s/86400)) h=$((s%86400/3600)) m=$((s%3600/60))
   if   [ $d -gt 0 ]; then LEFT="${d}d ${h}h"
   elif [ $h -gt 0 ]; then LEFT="${h}h ${m}m"
   else                    LEFT="${m}m"; fi
 }
 
-# ISO8601 -> epoch (소수점/타임존 흡수)
-#
-# 예전엔 `date -j -u -f ...` 를 썼는데, 이게 호출마다 프로세스를 띄운다.
-# 리셋 시각이 항목마다 있어서 한 번 그릴 때 3~4회씩 불렸다.
-# 입력은 항상 고정 포맷(YYYY-MM-DDTHH:MM:SS[.fff][Z])이라 산술로 끝난다.
+# ISO8601 -> epoch (소수점/타임존 흡수). 입력은 항상 고정 포맷
+# (YYYY-MM-DDTHH:MM:SS[.fff][Z])이라 date 스폰 없이 산술로 끝난다.
 #
 # days_from_civil (Howard Hinnant) — 그레고리력 윤년 규칙(4/100/400)을 그대로 따른다.
 # BSD date 와 1,015건(윤년 2024/2000/2100 · 경계값 · 랜덤 1000건) 전수 일치 확인했다.
-# 결과는 전역 EPOCH 으로 돌려준다. 명령치환으로 받으면 호출마다 서브셸이 뜬다.
 iso_epoch_set() {   # iso_epoch_set <ISO8601> -> $EPOCH (못 읽으면 빈 값)
   EPOCH=""
   local iso="${1%%.*}"
@@ -361,7 +340,7 @@ prompt_claude_login_if_needed() {
   [ "${TOKENHUD_AUTOLOGIN_PROMPT:-1}" = 1 ] || return
   system_awake || return
 
-  refresh=$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)
+  refresh=$c_rt
   if [ -n "$refresh" ]; then fp=$(tok_fp "$refresh"); else fp="missing"; fi
   [ -f "$marker" ] && saved=$(<"$marker")
   [ "$saved" = "$fp" ] && return
@@ -381,11 +360,8 @@ rlog() {   # rlog <claude|codex> <메시지>
     { tail -120 "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; }
 }
 
-# 12칸 게이지
-#
-# 예전엔 12회 루프를 돌며 문자를 붙였고, 호출마다 명령치환(서브셸)이 뗴다.
-# 가능한 문자열은 13가지뿐이니 미리 깔아두고 잘라 쓴다.
-# 결과는 전역 변수로 넘겨 서브셸 자체를 없앨다.
+# 12칸 게이지. 가능한 문자열은 13가지뿐이라 미리 깔아두고 잘라 쓴다.
+# 자르기는 글자 단위여야 한다 — 맨 위 LC_CTYPE 설정이 그걸 보장한다.
 BAR_FULL="████████████"
 BAR_EMPTY="░░░░░░░░░░░░"
 bar_set() {   # bar_set <pct> -> $BAR
@@ -441,14 +417,8 @@ pace_set() {   # pace_set <쓴%> <남은초> <창길이초> -> $PACE_ARROW $PACE
   if [ $(( pct * win )) -gt $(( 100 * elapsed )) ]; then
     PACE_ARROW="↑"
     PACE_BURN=$(( (100 - pct) * elapsed / pct ))
-    # 여기에 "리셋이 먼저 오면 경고 생략" 가드를 놓았었는데, 도달할 수 없는
-    # 분기였다. 과속이면 소진은 반드시 리셋 전에 온다 — 식으로 똑같다:
-    #   burn < left
-    #   (100-pct)*elapsed/pct < win - elapsed
-    #   (100-pct)*elapsed     < pct*win - pct*elapsed
-    #   100*elapsed           < pct*win          <- 위의 과속 조건 그자체
-    # 즉 바로 위 if 가 참이면 burn < left 도 항상 참이다. 가드를 남겨두면
-    # 읽는 사람이 "어떤 과속은 경고가 안 뜼나 보다"고 오해하게 된다.
+    # 과속 조건(100*elapsed < pct*win)은 burn < left 와 동치다 — 과속이면 소진은
+    # 항상 리셋보다 먼저다. 별도의 "리셋이 먼저면 생략" 가드는 필요 없다.
   else
     PACE_ARROW="↓"
   fi
@@ -461,8 +431,6 @@ row() {   # row <라벨> <%> <남은초> [창길이초]
     printf '  %-7s ░░░░░░░░░░░░    -- | %s color=%s\n' "$label" "$FONT" "$C_DIM"
     return
   fi
-  # 네 헬퍼 모두 전역 변수로 받는다 — 예전엔 행마다 명령치환 3개(=서브셸 3개)를
-  # 뗠워 행이 5개면 15개가 떴다. 내장 연산만으로 끝나는 일이라 전부 없앨다.
   bar_set "$pct"; human_left_set "$left"; color_set "$pct"; pace_set "$pct" "$left" "$win"
   # 화살표는 빈값일 때도 공백 1칸이라 아래행과 숫자 열이 안 틀어진다.
   printf '  %-7s %s %3d%%%s %s | %s %s\n' \
@@ -503,11 +471,10 @@ c_json=""; c_scoped=""; cx_on=""; cx_pct=""; c_rexp_g=""; c_rdays=""; c_exp_s=0
 # Keychain 값은 반드시 한 줄 JSON(-c) 이어야 한다. 개행이 섞이면
 # `security -w` 가 hex 덤프를 돌려줘 Claude Code 포함 전부가 못 읽는다(실측).
 claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
-  local exp="$1" now refresh req raw code body err current merged
-  local stamp="$CACHE_DIR/.claude_refresh_attempt" lock="$CACHE_DIR/.claude_refresh_lock"
+  local exp="$1" refresh=$c_rt req raw code body err current merged
+  local stamp="$CACHE_DIR/.claude_refresh_attempt"
 
   [ "${TOKENHUD_AUTOREFRESH:-1}" = 1 ] || return
-  now=$NOW
 
   # 파일에서 읽은 자격증명은 절대 회전시키지 않는다.
   #
@@ -516,7 +483,7 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
   #  - Keychain 을 못 읽었다면 회전 결과를 써넣는 것도 실패한다
   #    -> 서버만 회전하고 새 토큰은 잃는다 = 계정 사망(오늘 아침 그 사고).
   #  - 파일은 대개 오래된 스냅샷이라 이미 회전되어 죽은 refresh 토큰일 수 있다
-  #    -> 그걸로 회전을 시도하면 멀줦한 Keychain 쪽까지 invalid_grant 으로 끌고 간다.
+  #    -> 그걸로 회전을 시도하면 멀쩡한 Keychain 쪽까지 invalid_grant 으로 끌고 간다.
   # 회전은 Claude Code 가 하게 두고, 우린 보여주기만 한다.
   if [ "${c_src:-keychain}" = "file" ]; then
     c_refresh_err="refresh-readonly"; return
@@ -536,8 +503,7 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
   # -> prompt_claude_login_if_needed 의 case 가 안 맞아 재로그인 창이 영영 안 뜨고,
   #    드롭다운도 사유를 못 적는다. 메뉴바만 `-/-` 로 굳은 채 방치된다.
   # (실측 9/16: 05:56 회전 유실 -> 07:03 invalid_grant -> 17:14 까지 10시간 무음)
-  # 토큰이 없으면 만료 시각이 뭐든 자동 갱신은 불가능하다 -> 여기서 먼저 끊는다.
-  refresh=$(echo "$c_tok" | jq -r '.claudeAiOauth.refreshToken // empty')
+  # 토큰이 없으면 만료 시각이 뭔든 자동 갱신은 불가능하다 -> 여기서 먼저 끊는다.
   if [ -z "$refresh" ]; then
     c_refresh_err="refresh-missing"
     # 표시는 매분 하되, 로그만 쿨다운 간격으로 남긴다.
@@ -554,21 +520,12 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
   # expiresAt=0 은 "아직 안 만료됨"이 아니라 access 토큰이 아예 없다는 뜻이다.
   # refresh 토큰은 살아 있으므로 창을 기다릴 게 아니라 지금 바로 회전시킨다.
   if [ "${exp:-0}" -gt 0 ] 2>/dev/null; then
-    [ "$exp" -le $((now + ${TOKENHUD_CLAUDE_REFRESH_WINDOW:-900})) ] || return
+    [ "$exp" -le $((NOW + ${TOKENHUD_CLAUDE_REFRESH_WINDOW:-900})) ] || return
   fi
 
+  # 회전은 실행 락(RUN_LOCK)을 쥐 전체 경로에서만 한다. 락 없이 도는 실행은 읽기 전용.
+  [ "$NO_FETCH" = 1 ] && return
   refresh_ready "$stamp" "${TOKENHUD_CLAUDE_REFRESH_COOLDOWN:-600}" || return
-
-  if ! mkdir "$lock" 2>/dev/null; then
-    local lm=0
-    [ -d "$lock" ] && lm=$(stat -f %m "$lock" 2>/dev/null || echo 0)
-    if [ $((now - lm)) -ge 600 ]; then
-      rmdir "$lock" 2>/dev/null || return
-      mkdir "$lock" 2>/dev/null || return
-    else
-      return
-    fi
-  fi
 
   # 다크웨이크에서는 회전하지 않는다. 창이 2~5초라 요청 도중 다시 잠들고,
   # 그러면 서버만 회전시킨 채 새 토큰을 못 받아 계정이 죽는다(8/23 실측).
@@ -576,7 +533,7 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
   if ! system_awake; then
     rlog claude "skip — 다크웨이크(회전 보류)"
     rm -f "$stamp" 2>/dev/null   # 쿨다운 소모 없이 깨어난 뒤 바로 재시도
-    rmdir "$lock"; return
+    return
   fi
 
   # 토큰은 ps 노출을 피해 stdin 으로 넘긴다(Codex 쪽과 동일).
@@ -594,8 +551,8 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
     # 왕복 사이 Claude Code 가 먼저 회전시켰으면 이 응답을 버린다(회전 충돌 방지).
     current=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)
     [ -z "$current" ] && current="$c_tok"
-    if [ "$(echo "$current" | jq -r '.claudeAiOauth.refreshToken // empty')" = "$refresh" ]; then
-      merged=$( { printf '%s\n' "$current"; printf '%s' "$body"; } | jq -s -c --argjson now "$now" '
+    if [ "$(printf '%s' "$current" | jq -r '.claudeAiOauth.refreshToken // empty')" = "$refresh" ]; then
+      merged=$( { printf '%s\n' "$current"; printf '%s' "$body"; } | jq -s -c --argjson now "$NOW" '
         .[0] as $t | .[1] as $r | $t
         | .claudeAiOauth.accessToken = $r.access_token
         | if ($r.refresh_token // "") != "" then .claudeAiOauth.refreshToken = $r.refresh_token else . end
@@ -631,14 +588,22 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
     esac
     rlog claude "fail code=$code err=${err:-?} desc=$(err_desc "$body")"
   fi
-  rmdir "$lock"
+}
+
+# Keychain JSON 에서 필요한 필드를 jq 한 번으로 전부 뽑는다.
+# 구분자는 | — IFS 공백문자가 아니라 빈 필드가 안 뭉개진다(토큰에는 | 가 없다).
+claude_tok_parse() {   # c_tok -> c_plan c_exp c_rexp_g c_at c_rt
+  IFS='|' read -r c_plan c_exp c_rexp_g c_at c_rt <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
+    | [(.subscriptionType // ""), (.expiresAt // 0), (.refreshTokenExpiresAt // 0),
+       (.accessToken // ""), (.refreshToken // "")]
+    | map(tostring) | join("|")' 2>/dev/null)"
 }
 
 # 자격증명은 Keychain 이 1순위, `~/.claude/.credentials.json` 이 2순위다.
 #
 # CodexBar 도 ai-usagebar 도 둘 다 이 파일을 같이 본다. 그럴 이유가 있다:
 #  - SwiftBar 는 GUI 앱의 자식으로 돌아서 security 가 ACL 프롬프트 없이
-#    그냥 실패할 수 있다. 그러면 토큰이 멀줦해도 화면은 "Keychain 접근 거부"만 띄운다.
+#    그냥 실패할 수 있다. 그러면 토큰이 멀쩡해도 화면은 "Keychain 접근 거부"만 띄운다.
 #  - Claude Code 가 회전에 실패하면 Keychain 에 accessToken="" / refreshToken="" 인
 #    껍데기만 남긴다(실측 9/16). 이것도 "값은 있으나 쓸모가 없는" 경우다.
 #
@@ -646,23 +611,14 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
 # 반대로 Keychain 에 쓸만한 게 있으면 파일은 안 본다 — 파일 쪽이 더 오래된
 # 스냅샷일 수 있고, 오래된 refresh 토큰으로 회전을 시도하면 그거야말로
 # 오늘 겪은 invalid_grant 사고를 생산하는 길이다.
+CLAUDE_CRED_FILE="$HOME/.claude/.credentials.json"
+
 # Keychain 읽기 -> 필요하면 회전 -> 조회(또는 캐시) -> 파싱. 결과는 전역 c_* 변수.
 fetch_claude() {
-  CLAUDE_CRED_FILE="$HOME/.claude/.credentials.json"
   c_src="keychain"
   c_tok=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)
-
-  # jq 한 번으로 필요 필드를 전부 뽑는다(스폰 절감).
-  # 구분자는 | — IFS 공백문자가 아니라 빈 필드가 안 뭉개다.
-  claude_tok_parse() {
-    IFS='|' read -r c_plan c_exp c_rexp_g c_at_len c_rt_len <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
-      | [(.subscriptionType // ""), (.expiresAt // 0), (.refreshTokenExpiresAt // 0),
-         (.accessToken // "" | length), (.refreshToken // "" | length)]
-      | map(tostring) | join("|")' 2>/dev/null)"
-  }
   claude_tok_parse
-  if [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null && [ "${c_rt_len:-0}" -eq 0 ] 2>/dev/null \
-     && [ -r "$CLAUDE_CRED_FILE" ]; then
+  if [ -z "$c_at$c_rt" ] && [ -r "$CLAUDE_CRED_FILE" ]; then
     c_file=$(<"$CLAUDE_CRED_FILE")
     if printf '%s' "$c_file" | jq -e '.claudeAiOauth
          | ((.accessToken // "") != "") or ((.refreshToken // "") != "")' >/dev/null 2>&1; then
@@ -676,7 +632,6 @@ fetch_claude() {
     # 토큰 만료는 응답 코드로 판정하면 안 된다.
     # 만료된 토큰으로 치면 401 이 아니라 429 가 돌아온다(실측) -> "요청 과다"로
     # 잘못 안내하게 된다. expiresAt 이 있으니 치기 전에 먼저 본다.
-    now=$NOW
     c_exp_s=$(( ${c_exp%.*} / 1000 ))
 
     # 만료 15분 전부터 직접 회전. 성공하면 c_tok 이 새 토큰으로 바뀐다.
@@ -685,9 +640,7 @@ fetch_claude() {
 
     # 회전 결과를 반영해 만료 판정은 여기서 한 번만 한다.
     if [ "$c_rotated" = 1 ]; then
-      IFS='|' read -r c_exp c_rexp_g c_at_len <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
-        | [(.expiresAt // 0), (.refreshTokenExpiresAt // 0),
-           (.accessToken // "" | length)] | map(tostring) | join("|")')"
+      claude_tok_parse
       c_exp_s=$(( ${c_exp%.*} / 1000 ))
     fi
     c_dead=0
@@ -704,14 +657,14 @@ fetch_claude() {
     # 429 로 오면 throttled 로 잘못 분류돼 backoff 까지 걸리고, 화면엔
     # "요청 과다 — 잠시 후 자동 복구"라는 거짓 안내가 뜬다. 실제로는 재로그인이
     # 필요한 상태다. 그래서 조회 전에 여기서 끊는다.
-    [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null && c_dead=1
-    [ "$c_exp_s" -gt 0 ] 2>/dev/null && [ "$c_exp_s" -le "$now" ] && c_dead=1
+    [ -z "$c_at" ] && c_dead=1
+    [ "$c_exp_s" -gt 0 ] 2>/dev/null && [ "$c_exp_s" -le "$NOW" ] && c_dead=1
 
     # refresh 토큰까지 죽으면 자동 갱신도 끝이다(재로그인 외엔 방법 없음).
     # 정상 운영에선 회전이 30일 수명을 계속 밀어내므로 이 경고는 안전망이다.
     c_rdays=""
     [ "${c_rexp_g%.*}" -gt 0 ] 2>/dev/null && \
-      c_rdays=$(( ( ${c_rexp_g%.*} / 1000 - now ) / 86400 ))
+      c_rdays=$(( ( ${c_rexp_g%.*} / 1000 - NOW ) / 86400 ))
 
     if fresh claude; then
       # TTL 안 -> API 안 때리고 캐시 그대로. 경고도 안 띄운다(정상 동작).
@@ -720,14 +673,14 @@ fetch_claude() {
       # 이미 죽은 토큰이면 굳이 치지 않는다(429 만 유발한다).
       # 토큰 본체가 통째로 빈 경우는 만료와 원인이 달라 문구를 나눈다
       # (만료는 자동 갱신이 살리지만, 빈 토큰은 재로그인 말고 복구가 없다).
-      if [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null; then c_err="token-empty"; else c_err="expired"; fi
+      if [ -z "$c_at" ]; then c_err="token-empty"; else c_err="expired"; fi
       [ -f "$CACHE_DIR/claude.json" ] && c_json=$(<"$CACHE_DIR/claude.json") || c_json=""
     else
-      c_at=$(echo "$c_tok" | jq -r '.claudeAiOauth.accessToken // ""')
       # retry-after 가 비면 command substitution 이 끝의 빈 줄을 없애므로,
       # 항상 값이 있는 http_code 를 마지막에 두고 고정 마커로 필드를 나눈다.
-      raw=$("${CURL[@]}" -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' https://api.anthropic.com/api/oauth/usage \
-                -H "Authorization: Bearer $c_at" \
+      # 토큰 헤더는 stdin 으로 넘긴다(인자에 실으면 ps 에 노출된다).
+      raw=$(printf 'Authorization: Bearer %s\n' "$c_at" | "${CURL[@]}" -H @- \
+                -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' https://api.anthropic.com/api/oauth/usage \
                 -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null)
       code="${raw##*__TOKENHUD_CODE__}"; raw="${raw%__TOKENHUD_CODE__*}"
       c_retry="${raw##*__TOKENHUD_RETRY__}"; c_json="${raw%__TOKENHUD_RETRY__*}"
@@ -752,7 +705,6 @@ fetch_claude() {
   prompt_claude_login_if_needed
 
   if [ -n "$c_json" ]; then
-    now=$NOW
     IFS='|' read -r c5_pct c5_at c7_pct c7_at cx_on cx_pct <<<"$(printf '%s' "$c_json" | jq -r '
       [(.five_hour.utilization // ""), (.five_hour.resets_at // ""),
        (.seven_day.utilization // ""), (.seven_day.resets_at // ""),
@@ -782,19 +734,18 @@ fetch_claude() {
 # `codex login status` 는 상태만 읽고, access token 을 갱신하지 않는다(파일 mtime 실측).
 # exec 모드도 갱신 전용 명령이 아니다. 메뉴 플러그인이 만료 전에 직접 회전시킨다.
 codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
-  local auth="$1" exp="$2" now due=0 last_refresh last_epoch
-  local stamp="$CACHE_DIR/.codex_refresh_attempt" lock="$CACHE_DIR/.codex_refresh_lock"
+  local auth="$1" exp="$2" due=0 last_refresh last_epoch
+  local stamp="$CACHE_DIR/.codex_refresh_attempt"
   local refresh req raw code body err current tmp now_iso
 
   [ "${TOKENHUD_AUTOREFRESH:-1}" = 1 ] || return
-  now=$NOW
   if [ -n "$exp" ] && [ "$exp" != "null" ]; then
-    [ "$exp" -le $((now + ${TOKENHUD_CODEX_REFRESH_WINDOW:-900})) ] 2>/dev/null && due=1
+    [ "$exp" -le $((NOW + ${TOKENHUD_CODEX_REFRESH_WINDOW:-900})) ] 2>/dev/null && due=1
   else
     # 공식 구현도 JWT exp 를 못 읽을 때만 마지막 갱신 8일을 폴백으로 쓴다.
     last_refresh=$(jq -r '.last_refresh // empty' "$auth" 2>/dev/null)
     iso_epoch_set "$last_refresh"; last_epoch=$EPOCH
-    [ -n "$last_epoch" ] && [ "$last_epoch" -le $((now - 691200)) ] && due=1
+    [ -n "$last_epoch" ] && [ "$last_epoch" -le $((NOW - 691200)) ] && due=1
   fi
   [ "$due" = 1 ] || return
 
@@ -814,26 +765,15 @@ codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
   # 공식 Codex 는 만료 5분 전, HUD 는 15분 전에 갱신한다.
   # HUD 가 먼저 회전시키므로 정상 동작에서는 같은 refresh token 을 동시에 쓰지 않는다.
   # 이미 열린 Codex 도 갱신 직전 auth.json 을 다시 읽어 선행 회전을 반영한다.
+  [ "$NO_FETCH" = 1 ] && return
   refresh_ready "$stamp" "${TOKENHUD_CODEX_REFRESH_COOLDOWN:-600}" || return
-
-  if ! mkdir "$lock" 2>/dev/null; then
-    # 비정상 종료가 남긴 빈 락은 10분 뒤 회수한다.
-    local lm=0
-    [ -d "$lock" ] && lm=$(stat -f %m "$lock" 2>/dev/null || echo 0)
-    if [ $((now - lm)) -ge 600 ]; then
-      rmdir "$lock" 2>/dev/null || return
-      mkdir "$lock" 2>/dev/null || return
-    else
-      return
-    fi
-  fi
 
   # 다크웨이크에서는 회전하지 않는다. 창이 2~5초라 요청 도중 다시 잠들고,
   # 그러면 서버만 회전시킨 채 새 토큰을 못 받아 계정이 죽는다.
   if ! system_awake; then
     rlog codex "skip — 다크웨이크(회전 보류)"
     rm -f "$stamp" 2>/dev/null
-    rmdir "$lock"; return
+    return
   fi
 
   # 토큰은 프로세스 인자에 싣지 않고 stdin 으로 넘긴다(ps 에 노출 방지).
@@ -852,7 +792,7 @@ codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
     if [ "$current" = "$refresh" ]; then
       umask 077
       tmp=$(mktemp "${auth}.tokenhud.XXXXXX") || {
-        x_refresh_err="refresh-save"; rlog codex "SAVE FAIL — mktemp"; rmdir "$lock"; return;
+        x_refresh_err="refresh-save"; rlog codex "SAVE FAIL — mktemp"; return;
       }
       now_iso=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
       { cat "$auth"; printf '\n%s\n' "$body"; } | jq -s --arg now "$now_iso" '
@@ -862,11 +802,11 @@ codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
         | if ($r.refresh_token // "") != "" then .tokens.refresh_token = $r.refresh_token else . end
         | .last_refresh = $now
       ' > "$tmp" || {
-        rm -f "$tmp"; x_refresh_err="refresh-save"; rlog codex "SAVE FAIL — merge"; rmdir "$lock"; return;
+        rm -f "$tmp"; x_refresh_err="refresh-save"; rlog codex "SAVE FAIL — merge"; return;
       }
       chmod 600 "$tmp"
       mv "$tmp" "$auth" || {
-        rm -f "$tmp"; x_refresh_err="refresh-save"; rlog codex "SAVE FAIL — mv"; rmdir "$lock"; return;
+        rm -f "$tmp"; x_refresh_err="refresh-save"; rlog codex "SAVE FAIL — mv"; return;
       }
       clear_dead codex
       rlog codex "ok"; x_rotated=1
@@ -887,7 +827,6 @@ codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
     esac
     rlog codex "fail code=$code err=${err:-?} desc=$(err_desc "$body")"
   fi
-  rmdir "$lock"
 }
 
 # ── Codex ─────────────────────────────────────────────────────────────
@@ -918,9 +857,9 @@ fetch_codex() {
         x_err="expired"
         [ -f "$CACHE_DIR/codex.json" ] && x_json=$(<"$CACHE_DIR/codex.json") || x_json=""
       else
-        raw=$("${CURL[@]}" -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' \
+        raw=$(printf 'Authorization: Bearer %s\n' "$x_at" | "${CURL[@]}" -H @- \
+                  -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' \
                   "https://chatgpt.com/backend-api/wham/usage" \
-                  -H "Authorization: Bearer $x_at" \
                   -H "chatgpt-account-id: $x_acc" 2>/dev/null)
         code="${raw##*__TOKENHUD_CODE__}"; raw="${raw%__TOKENHUD_CODE__*}"
         x_retry="${raw##*__TOKENHUD_RETRY__}"; x_json="${raw%__TOKENHUD_RETRY__*}"
@@ -947,7 +886,6 @@ fetch_codex() {
 
   if [ -n "$x_json" ]; then
     # 상대값(reset_after_seconds)은 캐시 중 계속 낡는다. 절대 reset_at을 사용한다.
-    now=$NOW
     IFS='|' read -r x_plan x7_pct x7_at <<<"$(printf '%s' "$x_json" | jq -r '
       ([.rate_limit.primary_window, .rate_limit.secondary_window]
        | map(select(. != null and .limit_window_seconds > 21600))) as $w
@@ -1025,7 +963,8 @@ snapshot_save() {
 # 동시에 두 개가 전체 경로를 돌면 같은 API 를 두 번 친다. 타이머 실행 중에
 # 워처의 refreshallplugins 나 메뉴 클릭이 겹치면 실제로 그렇게 된다(SwiftBar 는 이전
 # 실행을 취소해도 프로세스를 죽이지 않는다). 전체 경로는 한 번에 하나만 돈다.
-# 낙은 락 회수 기준 120초 = 회전 최대 45초 + 조회 8초 x 2 에 여유.
+# 낡은 락 회수 기준 120초 = 회전 최대 45초 + 조회 8초 x 2 에 여유.
+# 회수돼도 같은 토큰을 두 번 회전시키지는 않는다: 회전 전 남기는 쿨다운 표식이 10분간 막는다.
 RUN_LOCK="$CACHE_DIR/.run_lock"
 run_lock() {
   local lm
@@ -1036,7 +975,7 @@ run_lock() {
   mkdir "$RUN_LOCK" 2>/dev/null
 }
 
-FAST=0; ROUND_DUE=0
+FAST=0; ROUND_DUE=0; NO_FETCH=0
 if [ "$BUSTED" = 0 ] && [ ! -f "$BUST" ] && snapshot_load; then
   # 자리 비움 스냅샷은 사람이 돌아오면 바로 버린다(밀린 조회를 즉시 하도록).
   if [ "$NOW" -lt "$VALID_UNTIL" ] && { [ "$SNAP_IDLE" != 1 ] || user_idle; }; then
@@ -1048,11 +987,12 @@ fi
 if [ "$FAST" = 0 ]; then
   if run_lock; then
     trap 'rmdir "$RUN_LOCK" 2>/dev/null' EXIT
-  elif snapshot_load; then
-    # 다른 실행이 지금 조회 중이다. 중복 호출 대신 직전 값을 그린다.
+  else
+    # 다른 실행이 지금 조회 중이다. 중복 호출 대신 직전 값을 그린다 — 스냅샷이
+    # 있으면 그것을, 없으면(오류 상태) 캐시만 읽는 전체 경로를 돈다.
     # 강제 갱신을 소모했다면 돌려놓아 다음 실행이 이어받게 한다.
     [ "$BUSTED" = 1 ] && touch "$BUST"
-    FAST=1
+    if snapshot_load; then FAST=1; else NO_FETCH=1; fi
   fi
 fi
 
@@ -1072,6 +1012,7 @@ fi
 # ── 메뉴바 타이틀 ─────────────────────────────────────────────────────
 # Claude 5시간/주간 + Codex 주간을 PNG 한 장으로 합성한다.
 # SwiftBar는 한 줄에 이미지 하나만 받을 수 있어 렌더러를 따로 둔다.
+
 # "12.7" / "" / "null" -> 12 / -1 / -1
 # 렌더러엔 정수만 넘긴다(Swift 쪽 Int() 가 소수점을 못 먹고 그대로 -1 로 떨어진다).
 pctint_set() {   # pctint_set <변수명> <값>
@@ -1115,7 +1056,7 @@ esac
 # 토큰 본체가 빈 상태도 재로그인 외엔 복구가 없다.
 [ "$c_err" = "token-empty" ] && relogin=1
 
-[ "$FAST" = 0 ] && snapshot_save
+[ "$FAST" = 0 ] && [ "$NO_FETCH" = 0 ] && snapshot_save
 
 # 렌더러가 없을 때의 텍스트 폴백.
 fmt() { [ "$1" -lt 0 ] 2>/dev/null && echo "–" || echo "$1"; }
@@ -1175,7 +1116,8 @@ cache_age() {
   local f="$CACHE_DIR/$1.json"
   [ -f "$f" ] || { echo ""; return; }
   local m; m=$(stat -f %m "$f" 2>/dev/null) || { echo ""; return; }
-  human_left $(( NOW - m ))
+  human_left_set $(( NOW - m ))
+  echo "$LEFT"
 }
 
 # 실패 원인 -> 사람이 읽을 문구.  why <오류> [expired문구] [도구이름]
@@ -1283,7 +1225,7 @@ echo "새로고침 | refresh=true"
 echo "지금 강제 갱신 | bash=/usr/bin/touch param1=$BUST terminal=false refresh=true"
 [ -n "$relogin" ] && \
   echo "Claude 재로그인 | bash=/opt/homebrew/bin/claude param1=auth param2=login terminal=true refresh=true"
-# 서버 값을 받은 시각을 보여준다(실행 시각을 찍으면 캐시가 낙아도 방금 받은 것처럼 보인다).
+# 서버 값을 받은 시각을 보여준다(실행 시각을 찍으면 캐시가 낡아도 방금 받은 것처럼 보인다).
 clock_set "$DATA_AT"
 if [ -n "$c_err$x_refresh_err" ] || { [ -n "$x_err" ] && [ "$x_err" != "not-installed" ]; }; then
   echo "업데이트 $CLOCK  ·  캐시 사용중 | $SMALL color=$C_WARN"

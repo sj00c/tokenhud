@@ -21,17 +21,15 @@
 CACHE_DIR="$HOME/.cache/tokenhud"
 [ -d "$CACHE_DIR" ] || mkdir -p "$CACHE_DIR"
 
-# 네트워크가 실제로 살아있는지 (DNS+TCP 까지 확인)
+# 네트워크가 실제로 살아있는지 (DNS+TCP 까지 확인).
+# 404 여도 연결은 된 것이므로 curl 종료코드로 판단한다.
 net_up() {
   /usr/bin/curl -s -o /dev/null --max-time 5 \
     --connect-timeout 4 https://api.anthropic.com/ 2>/dev/null
-  # 404 여도 연결은 된 것이므로 curl 종료코드로 판단한다
-  [ $? -eq 0 ]
 }
 
-# net_reachable: scutil reads system state only, zero network traffic.
-# (before: curl every 30s = 2,880 req/day. now curl only on up-transitions)
-# "Not Reachable" also contains "Reachable" -> line-start anchor required.
+# 도달 가능 여부. scutil 은 시스템 상태만 읽어 트래픽이 없다(curl 은 kick 때만).
+# "Not Reachable" 에도 "Reachable" 이 들어 있어 앞에 고정해 비교한다.
 net_reachable() {
   case "$(scutil -r api.anthropic.com 2>/dev/null)" in Reachable*) return 0;; esac
   return 1
