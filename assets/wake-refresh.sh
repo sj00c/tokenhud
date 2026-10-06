@@ -11,10 +11,15 @@
 #   1) 캐시 무효화 표식을 남긴다(.bust) -> 플러그인이 TTL 을 건너뛰고 서버를 친다
 #   2) SwiftBar 에 새로고침을 지시한다(swiftbar://refreshallplugins)
 #
+# 사람이 앞에 있을 때만 발동한다. 다크웨이크(화면 꺼진 채 몇 초 깨는 것)도
+# 벽시계 점프와 네트워크 재연결을 같이 일으키는데, 예전에는 그때마다 curl 확인과
+# 강제 갱신을 날려 하룻밤에 20번씩 발동했다(wake.log 실측 10/5~6). 아무도 안 보는 값이다.
+# 깨어남·연결 복구는 표시만 해두고, 키보드/마우스 입력이 들어오면 그때 한 번 갱신한다.
+#
 # launchd 가 이 스크립트를 상주시키고, 죽으면 다시 띄운다.
 
 CACHE_DIR="$HOME/.cache/tokenhud"
-mkdir -p "$CACHE_DIR"
+[ -d "$CACHE_DIR" ] || mkdir -p "$CACHE_DIR"
 
 # 네트워크가 실제로 살아있는지 (DNS+TCP 까지 확인)
 net_up() {
@@ -27,7 +32,18 @@ net_up() {
 # net_reachable: scutil reads system state only, zero network traffic.
 # (before: curl every 30s = 2,880 req/day. now curl only on up-transitions)
 # "Not Reachable" also contains "Reachable" -> line-start anchor required.
-net_reachable() { scutil -r api.anthropic.com 2>/dev/null | grep -q '^Reachable'; }
+net_reachable() {
+  case "$(scutil -r api.anthropic.com 2>/dev/null)" in Reachable*) return 0;; esac
+  return 1
+}
+
+# 최근 2분 안에 키보드/마우스 입력이 있었나. 다크웨이크에서는 절대 참이 안 된다.
+user_present() {
+  local out v
+  out=$(ioreg -c IOHIDSystem -d 4 -r -k HIDIdleTime 2>/dev/null)
+  v="${out#*\"HIDIdleTime\" = }"; v="${v%%[!0-9]*}"
+  [ -n "$v" ] && [ "$v" != "$out" ] && [ $(( v / 1000000000 )) -lt 120 ]
+}
 
 # debounce 는 파일로 관리한다.
 # 메모리 변수로 하면 워처가 두 개 뜬 경우(unload 때 안 죽고 남은 유령 등)
@@ -57,34 +73,36 @@ kick() {   # kick <사유>
 # ── 깨어남 감지 ───────────────────────────────────────────────────────
 # 자는 동안은 프로세스도 멈추므로, 벽시계가 크게 점프하면 잔 것으로 본다.
 # (sleep 30 을 걸어두고 실제 경과가 훨씬 길면 그 차이가 잔 시간이다)
-last=$(date +%s)
+# SECONDS 는 bash 내장 벽시계 경과초라 잠든 시간만큼 같이 뛴다. 매 주기 date 스폰이 없다.
+last=$SECONDS
 last_net=0
 net_reachable && last_net=1
+pending=""   # 사람이 돌아오면 날릴 kick 사유
 
 while true; do
   sleep 30
-  now=$(date +%s)
-  gap=$(( now - last ))
-  last=$now
+  gap=$(( SECONDS - last ))
+  last=$SECONDS
 
   # 30초 자려 했는데 90초 넘게 지났다 = 절전에서 깨어남
-  if [ "$gap" -gt 90 ]; then
-    kick "wake (${gap}s 공백)"
-    # kick 이 내부에서 대기하는 동안 상태가 바뀔 수 있으니 다시 읽는다
-    net_up && last_net=1 || last_net=0
-    last=$(date +%s)
-    continue
-  fi
+  [ "$gap" -gt 90 ] && pending="wake (${gap}s 공백)"
 
   # 네트워크가 끊겼다가 다시 붙은 순간
   # steady-state: scutil only. curl confirm just on the down->up transition.
   if net_reachable; then
-    if [ "$last_net" = 0 ] && net_up; then
-      kick "network up"
+    if [ "$last_net" = 0 ]; then
       last_net=1
-      last=$(date +%s)
+      [ -z "$pending" ] && pending="network up"
     fi
   else
     last_net=0
   fi
+
+  [ -n "$pending" ] || continue
+  user_present || continue
+  kick "$pending"
+  pending=""
+  # kick 이 내부에서 대기하는 동안 상태가 바뀜 수 있으니 다시 읽는다
+  net_reachable && last_net=1 || last_net=0
+  last=$SECONDS
 done

@@ -88,9 +88,17 @@ sed "s|__TOKENHUD_DIR__|$PWD|" launchd/com.sj.tokenhud.wake.plist > ~/Library/La
 launchctl load ~/Library/LaunchAgents/com.sj.tokenhud.wake.plist
 ```
 
-- 입력: `assets/wake-refresh.sh`가 `scutil`로 네트워크 복구를 감시함.
-- 출력: 복구 시 `.bust` 표식과 `swiftbar://refreshallplugins` 호출.
+- 입력: `assets/wake-refresh.sh`가 벽시계 점프로 깨어남을, `scutil`로 네트워크 복구를 감시함.
+- 출력: 키보드/마우스 입력이 들어온 뒤 `.bust` 표식과 `swiftbar://refreshallplugins` 호출.
+- 다크웨이크(화면 꺼진 채 잠깐 깨는 것)에서는 발동하지 않음. 사람이 돌아오면 그때 한 번 갱신함.
 - 주의: 절전에서 깬 직후 값이 몇 분간 낡은 채로 남는 문제를 없애기 위한 선택 구성.
+
+### 상시 실행 비용
+
+- 정상 상태에서는 TTL마다 한 번만 Keychain을 읽고 API를 조회함. 그 사이 실행은 `~/.cache/tokenhud/state.sh` 스냅샷만 읽어 외부 프로세스 1개(`date`)로 끝남.
+- 오류·토큰 회전·재로그인 판정이 필요한 상태에서는 스냅샷을 쓰지 않고 매번 전체 경로를 돔.
+- 키보드/마우스 입력이 `TOKENHUD_IDLE`초 이상 없으면 API를 조회하지 않음. 입력이 돌아오면 다음 실행에서 바로 조회함.
+- 동시에 여러 실행이 겹쳐도 전체 경로는 하나만 돌고, 나머지는 직전 값을 그림.
 
 ## 설정
 
@@ -105,6 +113,7 @@ launchctl load ~/Library/LaunchAgents/com.sj.tokenhud.wake.plist
 | `TOKENHUD_CODEX_REFRESH_COOLDOWN` | `600` | Codex 쪽 회전 재시도 간격 |
 | `TOKENHUD_ICON` | `logo` | `logo` 외의 값이면 이미지 없이 텍스트 타이틀만 그림 |
 | `TOKENHUD_ASSETS` | `../assets` | `hudimg`와 로고 PNG가 있는 경로 |
+| `TOKENHUD_IDLE` | `600` | 입력이 이 초만큼 없으면 API 조회를 쉼. `0`이면 항상 조회 |
 
 - 우선순위: 환경변수 > 기본값. 설정 파일은 없음.
 - 캐시 위치: `~/.cache/tokenhud/`
@@ -115,6 +124,7 @@ launchctl load ~/Library/LaunchAgents/com.sj.tokenhud.wake.plist
 - 파일에서 읽은 자격증명으로는 토큰 회전을 하지 않음. Keychain을 못 읽으면 쓰지도 못해 회전 중 토큰을 유실할 위험이 있음.
 - 회전 요청 중 네트워크가 끊기면 서버만 토큰을 교체한 상태가 되어 재로그인이 필요해짐.
 - 다크웨이크에서는 회전을 미룸. 창이 2~5초라 요청 도중 다시 잠들면 위와 같은 유실이 발생함.
+- 깨어 있음 판정은 최근 5분 내 키보드/마우스 입력으로 함. 입력 없이 오래 화면만 켜 둔 상태에서는 회전이 입력이 생길 때까지 미뤄짐.
 - `hudimg`는 arm64로만 검증됨. Intel Mac에서는 `swiftc` 재빌드가 필요함.
 - 추가분 항목은 리셋 창이 없어 소진 예측을 하지 않음.
 - 모델별 주간 한도는 서버가 주는 이름을 그대로 표시하므로 이름이 예고 없이 바뀔 수 있음.
@@ -124,6 +134,7 @@ launchctl load ~/Library/LaunchAgents/com.sj.tokenhud.wake.plist
 | 증상 | 원인 | 조치 |
 | --- | --- | --- |
 | 메뉴바에 아무것도 없음 | SwiftBar가 플러그인을 빈 출력으로 래치함 | SwiftBar 재시작 |
+| 메뉴바에 `SwiftBar`만 보임 | 플러그인 출력이 UTF-8로 안 읽혀 SwiftBar가 빈 출력으로 봄 | 플러그인 상단의 `LC_CTYPE` 설정이 있는지 확인 |
 | `Keychain 접근 거부` | 백그라운드 프로세스의 Keychain ACL 거부 | 화면 잠금 해제 후 새로고침, 또는 `claude auth login` |
 | `Keychain 못 읽음 — 파일 값으로 표시 중` | Keychain이 비었거나 껍데기만 남음 | `claude auth login`으로 자격증명 재생성 |
 | `자동 갱신 토큰 없음` | 회전 유실로 refresh 토큰이 사라짐 | `claude auth login` 외에 복구 수단 없음 |

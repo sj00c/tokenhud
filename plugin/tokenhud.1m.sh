@@ -10,8 +10,13 @@
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
+# launchd 로 뜬 SwiftBar 는 LANG/LC_* 없이 플러그인을 실행한다(C 로케일).
+# 그러면 bash 가 ${BAR_FULL:0:n} 을 바이트 단위로 잘라 █(3바이트)가 쪼개지고,
+# SwiftBar 는 UTF-8 로 못 읽은 출력을 빈 값으로 보고 메뉴바 항목을 숨긴다(실측).
+export LC_CTYPE="en_US.UTF-8"
+
 CACHE_DIR="$HOME/.cache/tokenhud"
-mkdir -p "$CACHE_DIR"
+[ -d "$CACHE_DIR" ] || mkdir -p "$CACHE_DIR"
 
 # 현재 시각을 한 번만 구한다.
 #
@@ -19,7 +24,17 @@ mkdir -p "$CACHE_DIR"
 # 필요할 때마다 `$(date +%s)` 를 불러 1회 실행에 13번이나 스폰했다(실측).
 # 한 번의 실행 안에서 몇 백 밀리초 차이는 의미가 없고, 오히려 같은 기준시각을
 # 써야 계산이 서로 어깤나지 않는다(예: 남은시간 계산 중 초가 넘어가는 경우).
-NOW=$(date +%s)
+# 표시용 로컬 시각도 같은 date 한 번에서 UTC 오프셋을 받아 산술로 만든다.
+read -r NOW TZ_OFF <<<"$(date '+%s %z')"
+TZ_SEC=$(( 10#${TZ_OFF:1:2} * 3600 + 10#${TZ_OFF:3:2} * 60 ))
+[ "${TZ_OFF:0:1}" = "-" ] && TZ_SEC=$(( -TZ_SEC ))
+
+# epoch -> 로컬 "HH:MM:SS". 서브셸 없이 전역 CLOCK 으로 돌려준다.
+clock_set() {   # clock_set <epoch> -> $CLOCK
+  local t=$(( ($1 + TZ_SEC) % 86400 ))
+  [ "$t" -lt 0 ] && t=$(( t + 86400 ))
+  printf -v CLOCK '%02d:%02d:%02d' $(( t / 3600 )) $(( t % 3600 / 60 )) $(( t % 60 ))
+}
 
 # 표시는 1분마다 하되 API 는 TTL 안에서 재사용한다.
 # Anthropic 쪽은 분당 폴링하면 429 를 뱉는다(실측). 기본 180초.
@@ -106,6 +121,33 @@ set_backoff() {   # set_backoff <claude|codex> <초>
 }
 clear_backoff() { rm -f "$CACHE_DIR/.$1_backoff_until" 2>/dev/null; }
 
+# 마지막 키보드/마우스 입력 뒤 몇 초가 지났나. ioreg 1회(≈20ms), 한 실행에 한 번만 잔다.
+#
+# 화면 전원 상태(IODisplayWrangler CurrentPowerState)는 Apple Silicon/macOS 15 에서
+# 더는 노출되지 않는다(실측 10/6) -> 사람이 있느냐는 HID 유휴 시간으로 판정한다.
+# 다크웨이크는 입력이 없으므로 유휴 시간이 잠들기 전부터 계속 늘어 있다.
+IDLE_SECS=""
+idle_secs_set() {   # -> $IDLE_SECS (못 읽으면 아주 큰 값 = 자리에 없음으로 본다)
+  [ -n "$IDLE_SECS" ] && return
+  local out v
+  out=$(ioreg -c IOHIDSystem -d 4 -r -k HIDIdleTime 2>/dev/null)
+  v="${out#*\"HIDIdleTime\" = }"; v="${v%%[!0-9]*}"
+  if [ -n "$v" ] && [ "$v" != "$out" ]; then IDLE_SECS=$(( v / 1000000000 )); else IDLE_SECS=999999; fi
+}
+
+# 사용자가 TOKENHUD_IDLE 초 이상 자리를 비웠나. 0 이면 판정하지 않는다(항상 조회).
+IDLE_LIMIT="${TOKENHUD_IDLE:-600}"
+user_idle() {
+  [ "$IDLE_LIMIT" -gt 0 ] 2>/dev/null || return 1
+  idle_secs_set
+  [ "$IDLE_SECS" -ge "$IDLE_LIMIT" ]
+}
+
+# 공급자별 데이터 시각(캐시 mtime). 스냅샷 유효기간과 드롭다운 표시에 쓴다.
+MT_claude=0; MT_codex=0
+# 자리를 비워 조회를 건너뛴 공급자가 있으면 1.
+IDLE_SKIP=0
+
 fresh() {
   local f="$CACHE_DIR/$1.json" m
   # backoff 중에는 캐시가 낙았어도 '신선한 셈' 치고 조회를 막는다.
@@ -120,10 +162,20 @@ fresh() {
     [ "$BUSTED" = 1 ] || return 0
     clear_backoff "$1"
   fi
-  [ "$BUSTED" = 1 ] && return 1
   [ -f "$f" ] || return 1
   m=$(stat -f %m "$f" 2>/dev/null) || return 1
-  [ $(( NOW - m )) -lt "$TTL" ]
+  printf -v "MT_$1" '%s' "$m"
+  # 한 공급자의 주기가 끝났으면(ROUND_DUE) 다른 쪽도 주기의 절반을 넘겼을 때 같이
+  # 받는다. 둔의 주기가 어긋나면 TTL 마다 전체 경로가 두 번 돈다. 공급자별 호출 빈도는
+  # 그대로(TTL 당 1회)이고, 오류 상태(스냅샷 없음)에서는 맞추지 않는다.
+  [ "$BUSTED" = 1 ] || [ $(( NOW - m )) -ge "$TTL" ] || \
+    { [ "$ROUND_DUE" = 1 ] && [ $(( NOW - m )) -ge $(( TTL / 2 )) ]; } || return 0
+  # 조회할 차례라도 사람이 없으면 아무도 안 보는 값을 위해 서버를 치지 않는다.
+  # 밤새 켜둔 맥이 180초마다 두 곳을 두드리던 게(하루 960회) 여기서 0이 된다.
+  # 강제 갱신(.bust)도 여기서 멈춘다 — 다크웨이크 때 워처가 남긴 표식은 입력이
+  # 없다. 메뉴에서 직접 누른 갱신은 입력이 방금 있었으니 통과한다.
+  if user_idle; then IDLE_SKIP=1; return 0; fi
+  return 1
 }
 
 # 캐시가 아직 "말이 되는" 값인지 판정한다.
@@ -142,7 +194,7 @@ cache_still_valid() {   # cache_still_valid <claude|codex>
     resets=$(jq -r '[.five_hour.resets_at, .seven_day.resets_at]
                     | map(select(. != null)) | .[0] // empty' "$f" 2>/dev/null)
     [ -z "$resets" ] && return 1
-    resets=$(iso_to_epoch "$resets")
+    iso_epoch_set "$resets"; resets=$EPOCH
   else
     resets=$(jq -r '[.rate_limit.primary_window, .rate_limit.secondary_window]
                     | map(select(. != null) | .reset_at) | min // empty' "$f" 2>/dev/null)
@@ -186,12 +238,14 @@ human_left_set() {   # human_left_set <초> -> $LEFT
 #
 # days_from_civil (Howard Hinnant) — 그레고리력 윤년 규칙(4/100/400)을 그대로 따른다.
 # BSD date 와 1,015건(윤년 2024/2000/2100 · 경계값 · 랜덤 1000건) 전수 일치 확인했다.
-iso_to_epoch() {
+# 결과는 전역 EPOCH 으로 돌려준다. 명령치환으로 받으면 호출마다 서브셸이 뜬다.
+iso_epoch_set() {   # iso_epoch_set <ISO8601> -> $EPOCH (못 읽으면 빈 값)
+  EPOCH=""
   local iso="${1%%.*}"
-  [ -z "$iso" ] || [ "$1" = "null" ] && { echo ""; return; }
+  { [ -z "$iso" ] || [ "$1" = "null" ]; } && return
   iso="${iso%Z}"
   # 포맷이 예상과 다르면 조용히 빈 값(호출쪽이 이미 빈 값을 처리한다).
-  [ ${#iso} -lt 19 ] && { echo ""; return; }
+  [ ${#iso} -lt 19 ] && return
   local y=$((10#${iso:0:4})) mo=$((10#${iso:5:2})) d=$((10#${iso:8:2}))
   local H=$((10#${iso:11:2})) M=$((10#${iso:14:2})) S=$((10#${iso:17:2}))
   local yy=$y era yoe doy doe days
@@ -202,7 +256,7 @@ iso_to_epoch() {
   else                  doy=$(( (153*(mo+9)+2)/5 + d-1 )); fi
   doe=$(( yoe*365 + yoe/4 - yoe/100 + doy ))
   days=$(( era*146097 + doe - 719468 ))
-  echo $(( days*86400 + H*3600 + M*60 + S ))
+  EPOCH=$(( days*86400 + H*3600 + M*60 + S ))
 }
 
 # JWT payload 의 exp. Codex access token 만료를 API 호출 전에 판정한다.
@@ -230,15 +284,16 @@ refresh_ready() {   # refresh_ready <표식파일> [초]
 # 그러면 "서버는 회전시켰는데 새 토큰은 못 받은" 상태로 로그인이 죽는다.
 # (8/23 실측: 19:15:30 다크웨이크 5초 창 -> 19:15:31 회전 -> code=000 -> 계정 사망)
 #
-# 판정: DisplayWrangler 전원 상태 4 = 화면 켜짐 = 사용자가 실제로 깨운 것.
-# 화면이 꺼져 있어도 PreventUserIdleSystemSleep/PreventSystemSleep 같은
-# 사용자 assertion 이 살아 있으면 정상 각성으로 본다(클램셸·프레젠테이션).
+# 판정: 최근 5분 안에 키보드/마우스 입력이 있었으면 사용자가 실제로 깨운 것.
+#
+# 예전 판정(IODisplayWrangler CurrentPowerState=4)은 macOS 15 에서 항목 자체가
+# 사라져 항상 거짓이었고, 뒷부분 assertion 판정만 남아 있었다. 그런데
+# PreventUserIdleSystemSleep 은 브라우저 재생·다운로드 같은 앱도 걸어두는 것이라
+# 다크웨이크에서도 참이 될 수 있다 — 막으려던 바로 그 사고의 구멍이다.
+# 입력 유무는 다크웨이크에서 절대 참이 안 된다. 틀려도 회전이 미뤄질 뿐이다.
 system_awake() {
-  ioreg -n IODisplayWrangler -r -d 1 2>/dev/null \
-    | grep -q '"IOPowerManagement".*"CurrentPowerState"=4' && return 0
-  pmset -g assertions 2>/dev/null \
-    | grep -qE '^\s+(PreventUserIdleSystemSleep|PreventSystemSleep)\s+1' && return 0
-  return 1
+  idle_secs_set
+  [ "$IDLE_SECS" -lt 300 ]
 }
 
 # 회전은 잠들면 안 되는 구간이다. caffeinate 로 그 구간만 붙잡는다.
@@ -430,7 +485,8 @@ pace_warn_flush() {
 }
 
 # ── Claude ────────────────────────────────────────────────────────────
-c5_pct=""; c5_left=""; c7_pct=""; c7_left=""; c_err=""; c_plan=""; c_refresh_err=""
+c5_pct=""; c5_e=""; c7_pct=""; c7_e=""; c_err=""; c_plan=""; c_refresh_err=""
+c_json=""; c_scoped=""; cx_on=""; cx_pct=""; c_rexp_g=""; c_rdays=""; c_exp_s=0
 
 # Claude OAuth 를 플러그인이 직접 회전시킨다. Codex 쪽과 같은 구조.
 #
@@ -590,133 +646,137 @@ claude_refresh_if_needed() {   # claude_refresh_if_needed <access-exp-epoch초>
 # 반대로 Keychain 에 쓸만한 게 있으면 파일은 안 본다 — 파일 쪽이 더 오래된
 # 스냅샷일 수 있고, 오래된 refresh 토큰으로 회전을 시도하면 그거야말로
 # 오늘 겪은 invalid_grant 사고를 생산하는 길이다.
-CLAUDE_CRED_FILE="$HOME/.claude/.credentials.json"
-c_src="keychain"
-c_tok=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)
+# Keychain 읽기 -> 필요하면 회전 -> 조회(또는 캐시) -> 파싱. 결과는 전역 c_* 변수.
+fetch_claude() {
+  CLAUDE_CRED_FILE="$HOME/.claude/.credentials.json"
+  c_src="keychain"
+  c_tok=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)
 
-# jq 한 번으로 필요 필드를 전부 뽑는다(스폰 절감).
-# 구분자는 | — IFS 공백문자가 아니라 빈 필드가 안 뭉개다.
-claude_tok_parse() {
-  IFS='|' read -r c_plan c_exp c_rexp_g c_at_len c_rt_len <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
-    | [(.subscriptionType // ""), (.expiresAt // 0), (.refreshTokenExpiresAt // 0),
-       (.accessToken // "" | length), (.refreshToken // "" | length)]
-    | map(tostring) | join("|")' 2>/dev/null)"
-}
-claude_tok_parse
-if [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null && [ "${c_rt_len:-0}" -eq 0 ] 2>/dev/null \
-   && [ -r "$CLAUDE_CRED_FILE" ]; then
-  c_file=$(<"$CLAUDE_CRED_FILE")
-  if printf '%s' "$c_file" | jq -e '.claudeAiOauth
-       | ((.accessToken // "") != "") or ((.refreshToken // "") != "")' >/dev/null 2>&1; then
-    c_tok="$c_file"; c_src="file"
-    claude_tok_parse
-    rlog claude "keychain 비어있음 -> .credentials.json 사용"
-  fi
-fi
-
-if [ -n "$c_tok" ]; then
-  # 토큰 만료는 응답 코드로 판정하면 안 된다.
-  # 만료된 토큰으로 치면 401 이 아니라 429 가 돌아온다(실측) -> "요청 과다"로
-  # 잘못 안내하게 된다. expiresAt 이 있으니 치기 전에 먼저 본다.
-  now=$NOW
-  c_exp_s=$(( ${c_exp%.*} / 1000 ))
-
-  # 만료 15분 전부터 직접 회전. 성공하면 c_tok 이 새 토큰으로 바뀐다.
-  c_rotated=0
-  claude_refresh_if_needed "$c_exp_s"
-
-  # 회전 결과를 반영해 만료 판정은 여기서 한 번만 한다.
-  if [ "$c_rotated" = 1 ]; then
-    IFS='|' read -r c_exp c_rexp_g c_at_len <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
-      | [(.expiresAt // 0), (.refreshTokenExpiresAt // 0),
-         (.accessToken // "" | length)] | map(tostring) | join("|")')"
-    c_exp_s=$(( ${c_exp%.*} / 1000 ))
-  fi
-  c_dead=0
-  # 토큰 본체가 비어 있으면 만료와 동급으로 친다.
-  #
-  # 회전이 깨지면 keychain 에 accessToken="" / expiresAt=0 인 껍데기가 남는다
-  # (실측 9/13: 회전 중 네트워크 끊김 -> invalid_grant -> 토큰 본체 소실).
-  # expiresAt 이 0 이면 아래 만료 검사의 `-gt 0` 이 거짓이라 가드를 통째로
-  # 빠져나가고, 빈 `Bearer ` 로 조회를 때리게 된다.
-  # 그리고 빈 Bearer 는 401 이 아니라 429 가 돌아온다(실측 9/14):
-  #   Bearer <빈값>   -> 429   <- 이게 함정
-  #   Bearer <쓰레기> -> 401
-  #   Bearer <정상>   -> 200
-  # 429 로 오면 throttled 로 잘못 분류돼 backoff 까지 걸리고, 화면엔
-  # "요청 과다 — 잠시 후 자동 복구"라는 거짓 안내가 뜬다. 실제로는 재로그인이
-  # 필요한 상태다. 그래서 조회 전에 여기서 끊는다.
-  [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null && c_dead=1
-  [ "$c_exp_s" -gt 0 ] 2>/dev/null && [ "$c_exp_s" -le "$now" ] && c_dead=1
-
-  # refresh 토큰까지 죽으면 자동 갱신도 끝이다(재로그인 외엔 방법 없음).
-  # 정상 운영에선 회전이 30일 수명을 계속 밀어내므로 이 경고는 안전망이다.
-  c_rdays=""
-  [ "${c_rexp_g%.*}" -gt 0 ] 2>/dev/null && \
-    c_rdays=$(( ( ${c_rexp_g%.*} / 1000 - now ) / 86400 ))
-
-  if fresh claude; then
-    # TTL 안 -> API 안 때리고 캐시 그대로. 경고도 안 띄운다(정상 동작).
-    c_json=$(<"$CACHE_DIR/claude.json")
-  elif [ "$c_dead" = 1 ]; then
-    # 이미 죽은 토큰이면 굳이 치지 않는다(429 만 유발한다).
-    # 토큰 본체가 통째로 빈 경우는 만료와 원인이 달라 문구를 나눈다
-    # (만료는 자동 갱신이 살리지만, 빈 토큰은 재로그인 말고 복구가 없다).
-    if [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null; then c_err="token-empty"; else c_err="expired"; fi
-    [ -f "$CACHE_DIR/claude.json" ] && c_json=$(<"$CACHE_DIR/claude.json") || c_json=""
-  else
-    c_at=$(echo "$c_tok" | jq -r '.claudeAiOauth.accessToken // ""')
-    # retry-after 가 비면 command substitution 이 끝의 빈 줄을 없애므로,
-    # 항상 값이 있는 http_code 를 마지막에 두고 고정 마커로 필드를 나눈다.
-    raw=$("${CURL[@]}" -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' https://api.anthropic.com/api/oauth/usage \
-              -H "Authorization: Bearer $c_at" \
-              -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null)
-    code="${raw##*__TOKENHUD_CODE__}"; raw="${raw%__TOKENHUD_CODE__*}"
-    c_retry="${raw##*__TOKENHUD_RETRY__}"; c_json="${raw%__TOKENHUD_RETRY__*}"
-    if [ "$code" = "200" ] && echo "$c_json" | jq -e '.five_hour' >/dev/null 2>&1; then
-      echo "$c_json" > "$CACHE_DIR/claude.json"
-      clear_backoff claude
-    else
-      case "$code" in
-        401|403) c_err="expired" ;;
-        429)     c_err="throttled"; set_backoff claude "${c_retry:-300}" ;;
-        "")      c_err="unreachable" ;;
-        *)       c_err="http $code" ;;
-      esac
-      [ -f "$CACHE_DIR/claude.json" ] && c_json=$(<"$CACHE_DIR/claude.json") || c_json=""
+  # jq 한 번으로 필요 필드를 전부 뽑는다(스폰 절감).
+  # 구분자는 | — IFS 공백문자가 아니라 빈 필드가 안 뭉개다.
+  claude_tok_parse() {
+    IFS='|' read -r c_plan c_exp c_rexp_g c_at_len c_rt_len <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
+      | [(.subscriptionType // ""), (.expiresAt // 0), (.refreshTokenExpiresAt // 0),
+         (.accessToken // "" | length), (.refreshToken // "" | length)]
+      | map(tostring) | join("|")' 2>/dev/null)"
+  }
+  claude_tok_parse
+  if [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null && [ "${c_rt_len:-0}" -eq 0 ] 2>/dev/null \
+     && [ -r "$CLAUDE_CRED_FILE" ]; then
+    c_file=$(<"$CLAUDE_CRED_FILE")
+    if printf '%s' "$c_file" | jq -e '.claudeAiOauth
+         | ((.accessToken // "") != "") or ((.refreshToken // "") != "")' >/dev/null 2>&1; then
+      c_tok="$c_file"; c_src="file"
+      claude_tok_parse
+      rlog claude "keychain 비어있음 -> .credentials.json 사용"
     fi
   fi
-else
-  c_err="keychain"
-fi
 
-prompt_claude_login_if_needed
+  if [ -n "$c_tok" ]; then
+    # 토큰 만료는 응답 코드로 판정하면 안 된다.
+    # 만료된 토큰으로 치면 401 이 아니라 429 가 돌아온다(실측) -> "요청 과다"로
+    # 잘못 안내하게 된다. expiresAt 이 있으니 치기 전에 먼저 본다.
+    now=$NOW
+    c_exp_s=$(( ${c_exp%.*} / 1000 ))
 
-if [ -n "$c_json" ]; then
-  now=$NOW
-  IFS='|' read -r c5_pct c5_at c7_pct c7_at cx_on cx_pct <<<"$(printf '%s' "$c_json" | jq -r '
-    [(.five_hour.utilization // ""), (.five_hour.resets_at // ""),
-     (.seven_day.utilization // ""), (.seven_day.resets_at // ""),
-     (.extra_usage.is_enabled // false),
-     (.extra_usage.utilization // "")] | map(tostring) | join("|")')"
-  e=$(iso_to_epoch "$c5_at"); [ -n "$e" ] && c5_left=$((e-now))
-  e=$(iso_to_epoch "$c7_at"); [ -n "$e" ] && c7_left=$((e-now))
+    # 만료 15분 전부터 직접 회전. 성공하면 c_tok 이 새 토큰으로 바뀐다.
+    c_rotated=0
+    claude_refresh_if_needed "$c_exp_s"
 
-  # 모델별 주간 한도는 최상위 seven_day_opus 에서 limits 배열로 옮겨졌다.
-  #
-  # seven_day_opus / seven_day_sonnet 는 이제 항상 null 이다(실측 8/23).
-  # 예전 코드는 `.seven_day_opus.utilization // ""` 로 읽어서 null 에 빈 문자열이
-  # 떨어졌고, `[ -n "$co_pct" ]` 가 항상 거짓이라 Opus 행이 통째로 안 그려졌다
-  # -> 실제로 6% 쓰고 있던 모델이 화면에 아예 없었다.
-  # 모델 이름을 박지 않고 scope 가 있는 weekly 항목을 전부 그린다
-  # (서버가 모델명을 바꿔도 따라간다).
-  c_scoped=$(printf '%s' "$c_json" | jq -r '
-    (.limits // [])[]
-    | select(type == "object")
-    | select(.group == "weekly" and (.scope.model.display_name // "") != "")
-    | select((.percent | type) == "number")
-    | "\(.scope.model.display_name)|\(.percent)|\(.resets_at // "")"' 2>/dev/null)
-fi
+    # 회전 결과를 반영해 만료 판정은 여기서 한 번만 한다.
+    if [ "$c_rotated" = 1 ]; then
+      IFS='|' read -r c_exp c_rexp_g c_at_len <<<"$(printf '%s' "$c_tok" | jq -r '.claudeAiOauth
+        | [(.expiresAt // 0), (.refreshTokenExpiresAt // 0),
+           (.accessToken // "" | length)] | map(tostring) | join("|")')"
+      c_exp_s=$(( ${c_exp%.*} / 1000 ))
+    fi
+    c_dead=0
+    # 토큰 본체가 비어 있으면 만료와 동급으로 친다.
+    #
+    # 회전이 깨지면 keychain 에 accessToken="" / expiresAt=0 인 껍데기가 남는다
+    # (실측 9/13: 회전 중 네트워크 끊김 -> invalid_grant -> 토큰 본체 소실).
+    # expiresAt 이 0 이면 아래 만료 검사의 `-gt 0` 이 거짓이라 가드를 통째로
+    # 빠져나가고, 빈 `Bearer ` 로 조회를 때리게 된다.
+    # 그리고 빈 Bearer 는 401 이 아니라 429 가 돌아온다(실측 9/14):
+    #   Bearer <빈값>   -> 429   <- 이게 함정
+    #   Bearer <쓰레기> -> 401
+    #   Bearer <정상>   -> 200
+    # 429 로 오면 throttled 로 잘못 분류돼 backoff 까지 걸리고, 화면엔
+    # "요청 과다 — 잠시 후 자동 복구"라는 거짓 안내가 뜬다. 실제로는 재로그인이
+    # 필요한 상태다. 그래서 조회 전에 여기서 끊는다.
+    [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null && c_dead=1
+    [ "$c_exp_s" -gt 0 ] 2>/dev/null && [ "$c_exp_s" -le "$now" ] && c_dead=1
+
+    # refresh 토큰까지 죽으면 자동 갱신도 끝이다(재로그인 외엔 방법 없음).
+    # 정상 운영에선 회전이 30일 수명을 계속 밀어내므로 이 경고는 안전망이다.
+    c_rdays=""
+    [ "${c_rexp_g%.*}" -gt 0 ] 2>/dev/null && \
+      c_rdays=$(( ( ${c_rexp_g%.*} / 1000 - now ) / 86400 ))
+
+    if fresh claude; then
+      # TTL 안 -> API 안 때리고 캐시 그대로. 경고도 안 띄운다(정상 동작).
+      c_json=$(<"$CACHE_DIR/claude.json")
+    elif [ "$c_dead" = 1 ]; then
+      # 이미 죽은 토큰이면 굳이 치지 않는다(429 만 유발한다).
+      # 토큰 본체가 통째로 빈 경우는 만료와 원인이 달라 문구를 나눈다
+      # (만료는 자동 갱신이 살리지만, 빈 토큰은 재로그인 말고 복구가 없다).
+      if [ "${c_at_len:-0}" -eq 0 ] 2>/dev/null; then c_err="token-empty"; else c_err="expired"; fi
+      [ -f "$CACHE_DIR/claude.json" ] && c_json=$(<"$CACHE_DIR/claude.json") || c_json=""
+    else
+      c_at=$(echo "$c_tok" | jq -r '.claudeAiOauth.accessToken // ""')
+      # retry-after 가 비면 command substitution 이 끝의 빈 줄을 없애므로,
+      # 항상 값이 있는 http_code 를 마지막에 두고 고정 마커로 필드를 나눈다.
+      raw=$("${CURL[@]}" -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' https://api.anthropic.com/api/oauth/usage \
+                -H "Authorization: Bearer $c_at" \
+                -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null)
+      code="${raw##*__TOKENHUD_CODE__}"; raw="${raw%__TOKENHUD_CODE__*}"
+      c_retry="${raw##*__TOKENHUD_RETRY__}"; c_json="${raw%__TOKENHUD_RETRY__*}"
+      if [ "$code" = "200" ] && echo "$c_json" | jq -e '.five_hour' >/dev/null 2>&1; then
+        echo "$c_json" > "$CACHE_DIR/claude.json"
+        MT_claude=$NOW
+        clear_backoff claude
+      else
+        case "$code" in
+          401|403) c_err="expired" ;;
+          429)     c_err="throttled"; set_backoff claude "${c_retry:-300}" ;;
+          "")      c_err="unreachable" ;;
+          *)       c_err="http $code" ;;
+        esac
+        [ -f "$CACHE_DIR/claude.json" ] && c_json=$(<"$CACHE_DIR/claude.json") || c_json=""
+      fi
+    fi
+  else
+    c_err="keychain"
+  fi
+
+  prompt_claude_login_if_needed
+
+  if [ -n "$c_json" ]; then
+    now=$NOW
+    IFS='|' read -r c5_pct c5_at c7_pct c7_at cx_on cx_pct <<<"$(printf '%s' "$c_json" | jq -r '
+      [(.five_hour.utilization // ""), (.five_hour.resets_at // ""),
+       (.seven_day.utilization // ""), (.seven_day.resets_at // ""),
+       (.extra_usage.is_enabled // false),
+       (.extra_usage.utilization // "")] | map(tostring) | join("|")')"
+    iso_epoch_set "$c5_at"; c5_e=$EPOCH
+    iso_epoch_set "$c7_at"; c7_e=$EPOCH
+
+    # 모델별 주간 한도는 최상위 seven_day_opus 에서 limits 배열로 옮겨졌다.
+    #
+    # seven_day_opus / seven_day_sonnet 는 이제 항상 null 이다(실측 8/23).
+    # 예전 코드는 `.seven_day_opus.utilization // ""` 로 읽어서 null 에 빈 문자열이
+    # 떨어졌고, `[ -n "$co_pct" ]` 가 항상 거짓이라 Opus 행이 통째로 안 그려졌다
+    # -> 실제로 6% 쓰고 있던 모델이 화면에 아예 없었다.
+    # 모델 이름을 박지 않고 scope 가 있는 weekly 항목을 전부 그린다
+    # (서버가 모델명을 바꿔도 따라간다).
+    c_scoped=$(printf '%s' "$c_json" | jq -r '
+      (.limits // [])[]
+      | select(type == "object")
+      | select(.group == "weekly" and (.scope.model.display_name // "") != "")
+      | select((.percent | type) == "number")
+      | "\(.scope.model.display_name)|\(.percent)|\(.resets_at // "")"' 2>/dev/null)
+  fi
+}
 
 # Codex 0.139.0 자체 구현과 같은 OAuth refresh 흐름.
 # `codex login status` 는 상태만 읽고, access token 을 갱신하지 않는다(파일 mtime 실측).
@@ -733,7 +793,7 @@ codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
   else
     # 공식 구현도 JWT exp 를 못 읽을 때만 마지막 갱신 8일을 폴백으로 쓴다.
     last_refresh=$(jq -r '.last_refresh // empty' "$auth" 2>/dev/null)
-    last_epoch=$(iso_to_epoch "$last_refresh")
+    iso_epoch_set "$last_refresh"; last_epoch=$EPOCH
     [ -n "$last_epoch" ] && [ "$last_epoch" -le $((now - 691200)) ] && due=1
   fi
   [ "$due" = 1 ] || return
@@ -832,89 +892,199 @@ codex_refresh_if_needed() {   # codex_refresh_if_needed <auth.json> <access-exp>
 
 # ── Codex ─────────────────────────────────────────────────────────────
 # 현재 계정은 서버와 공식 대시보드 모두 주간 창만 제공한다.
-x7_pct=""; x7_left=""; x_err=""; x_plan=""; x_refresh_err=""
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-X_AUTH="$CODEX_HOME/auth.json"
-if [ -f "$X_AUTH" ]; then
-  IFS='|' read -r x_at x_acc <<<"$(jq -r '[(.tokens.access_token // ""), (.tokens.account_id // "")] | join("|")' "$X_AUTH" 2>/dev/null)"
-  xexp=$(jwt_exp "$x_at")
-  x_rotated=0
-  codex_refresh_if_needed "$X_AUTH" "$xexp"
-
-  # 갱신 성공 또는 다른 Codex 의 선행 갱신을 반영한다.
-  if [ "$x_rotated" = 1 ]; then
-    x_at=$(jq -r '.tokens.access_token // ""' "$X_AUTH" 2>/dev/null)
+x7_pct=""; x7_e=""; x_err=""; x_plan=""; x_refresh_err=""; x_json=""; xexp=""
+# auth.json 읽기 -> 필요하면 회전 -> 조회(또는 캐시) -> 파싱. 결과는 전역 x_* 변수.
+fetch_codex() {
+  CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+  X_AUTH="$CODEX_HOME/auth.json"
+  if [ -f "$X_AUTH" ]; then
+    IFS='|' read -r x_at x_acc <<<"$(jq -r '[(.tokens.access_token // ""), (.tokens.account_id // "")] | join("|")' "$X_AUTH" 2>/dev/null)"
     xexp=$(jwt_exp "$x_at")
-  fi
-  x_dead=0
-  [ -n "$xexp" ] && [ "$xexp" -le "$NOW" ] 2>/dev/null && x_dead=1
+    x_rotated=0
+    codex_refresh_if_needed "$X_AUTH" "$xexp"
 
-  if [ -n "$x_at" ]; then
-    if fresh codex; then
-      x_json=$(<"$CACHE_DIR/codex.json")
-    elif [ "$x_dead" = 1 ]; then
-      x_err="expired"
-      [ -f "$CACHE_DIR/codex.json" ] && x_json=$(<"$CACHE_DIR/codex.json") || x_json=""
-    else
-      raw=$("${CURL[@]}" -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' \
-                "https://chatgpt.com/backend-api/wham/usage" \
-                -H "Authorization: Bearer $x_at" \
-                -H "chatgpt-account-id: $x_acc" 2>/dev/null)
-      code="${raw##*__TOKENHUD_CODE__}"; raw="${raw%__TOKENHUD_CODE__*}"
-      x_retry="${raw##*__TOKENHUD_RETRY__}"; x_json="${raw%__TOKENHUD_RETRY__*}"
-      if [ "$code" = "200" ] && echo "$x_json" | jq -e '.rate_limit' >/dev/null 2>&1; then
-        echo "$x_json" > "$CACHE_DIR/codex.json"
-        clear_backoff codex
-      else
-        case "$code" in
-          401|403) x_err="expired" ;;
-          429)     x_err="throttled"; set_backoff codex "${x_retry:-300}" ;;
-          "")      x_err="unreachable" ;;
-          *)       x_err="http $code" ;;
-        esac
+    # 갱신 성공 또는 다른 Codex 의 선행 갱신을 반영한다.
+    if [ "$x_rotated" = 1 ]; then
+      x_at=$(jq -r '.tokens.access_token // ""' "$X_AUTH" 2>/dev/null)
+      xexp=$(jwt_exp "$x_at")
+    fi
+    x_dead=0
+    [ -n "$xexp" ] && [ "$xexp" -le "$NOW" ] 2>/dev/null && x_dead=1
+
+    if [ -n "$x_at" ]; then
+      if fresh codex; then
+        x_json=$(<"$CACHE_DIR/codex.json")
+      elif [ "$x_dead" = 1 ]; then
+        x_err="expired"
         [ -f "$CACHE_DIR/codex.json" ] && x_json=$(<"$CACHE_DIR/codex.json") || x_json=""
+      else
+        raw=$("${CURL[@]}" -w '\n__TOKENHUD_RETRY__%header{retry-after}__TOKENHUD_CODE__%{http_code}' \
+                  "https://chatgpt.com/backend-api/wham/usage" \
+                  -H "Authorization: Bearer $x_at" \
+                  -H "chatgpt-account-id: $x_acc" 2>/dev/null)
+        code="${raw##*__TOKENHUD_CODE__}"; raw="${raw%__TOKENHUD_CODE__*}"
+        x_retry="${raw##*__TOKENHUD_RETRY__}"; x_json="${raw%__TOKENHUD_RETRY__*}"
+        if [ "$code" = "200" ] && echo "$x_json" | jq -e '.rate_limit' >/dev/null 2>&1; then
+          echo "$x_json" > "$CACHE_DIR/codex.json"
+          MT_codex=$NOW
+          clear_backoff codex
+        else
+          case "$code" in
+            401|403) x_err="expired" ;;
+            429)     x_err="throttled"; set_backoff codex "${x_retry:-300}" ;;
+            "")      x_err="unreachable" ;;
+            *)       x_err="http $code" ;;
+          esac
+          [ -f "$CACHE_DIR/codex.json" ] && x_json=$(<"$CACHE_DIR/codex.json") || x_json=""
+        fi
       fi
+    else
+      x_err="no-token"
     fi
   else
-    x_err="no-token"
+    x_err="not-installed"
   fi
-else
-  x_err="not-installed"
+
+  if [ -n "$x_json" ]; then
+    # 상대값(reset_after_seconds)은 캐시 중 계속 낡는다. 절대 reset_at을 사용한다.
+    now=$NOW
+    IFS='|' read -r x_plan x7_pct x7_at <<<"$(printf '%s' "$x_json" | jq -r '
+      ([.rate_limit.primary_window, .rate_limit.secondary_window]
+       | map(select(. != null and .limit_window_seconds > 21600))) as $w
+      | [(.plan_type // ""),
+         (if ($w|length)>0 then ($w[0].used_percent|tostring) else "" end),
+         (if ($w|length)>0 then ($w[0].reset_at|tostring) else "" end)]
+      | join("|")')"
+    [ -n "$x7_at" ] && [ "$x7_at" != "null" ] && x7_e=${x7_at%.*}
+  fi
+}
+
+# ── 실행 흐름: 스냅샷 → (필요할 때만) 전체 경로 ───────────────────────────
+# SwiftBar 는 매분 플러그인을 새 프로세스로 띄운다. 값은 TTL(180초)마다만 바뀌는데
+# 매분 Keychain 을 열고 jq 를 대여섯 번 띄우던 게 실행당 프로세스 약 50개(하루 7만개)였다.
+# 정상 상태를 그리는 데 필요한 값만 스냅샷으로 남기고, 유효한 동안은 그것만 읽는다
+# -> Keychain·jq·네트워크 0회.
+#
+# 스냅샷은 오류가 하나도 없을 때만 쓴다. 오류·회전·재로그인 판정은 전부
+# 예전과 같은 전체 경로가 매번 다룬다. 빠른 경로는 '건강한 값 다시 그리기' 전용이다.
+SNAP="$CACHE_DIR/state.sh"
+SNAP_VARS="c_plan c5_pct c5_e c7_pct c7_e cx_on cx_pct c_scoped c_rexp_g x_err x_plan x7_pct x7_e DATA_AT VALID_UNTIL SNAP_IDLE"
+
+# 스냅샷을 현재 셸에 올린다. 없거나 재로그인이 필요해졌으면 실패.
+snapshot_load() {
+  [ -f "$SNAP" ] || return 1
+  . "$SNAP" 2>/dev/null || return 1
+  [ -n "$VALID_UNTIL" ] || return 1
+  c_rdays=""
+  [ "${c_rexp_g%.*}" -gt 0 ] 2>/dev/null && \
+    c_rdays=$(( ( ${c_rexp_g%.*} / 1000 - NOW ) / 86400 ))
+  [ -n "$c_rdays" ] && [ "$c_rdays" -le 0 ] 2>/dev/null && return 1
+  # 렌더러는 c_json/x_json 의 내용이 아니라 '값이 있느냐'만 본다.
+  c_json=snapshot
+  [ -z "$x_err" ] && x_json=snapshot
+  return 0
+}
+
+# 전체 경로로 갈 때 스냅샷에서 올라온 값을 지운다. 남아 있으면 조회가 실패한
+# 공급자 자리에 예전 값이 현재 값처럼 그려진다.
+snapshot_reset() {
+  local v
+  for v in $SNAP_VARS; do printf -v "$v" '%s' ""; done
+  c_json=""; x_json=""; c_rdays=""
+}
+
+# 전체 경로가 끝난 뒤 건강한 상태면 스냅샷을 남긴다. 아니면 지운다.
+snapshot_save() {
+  local v cap
+  # Codex 미설치는 오류가 아니라 항상 그런 상태다 — 스냅샷을 막지 않는다.
+  if [ -n "$c_err$c_refresh_err$x_refresh_err$relogin" ] || [ -z "$c_json" ] \
+     || [ "$c_src" != "keychain" ] || [ "$MT_claude" = 0 ] \
+     || { [ -n "$x_err" ] && [ "$x_err" != "not-installed" ]; } \
+     || { [ -z "$x_err" ] && [ "$MT_codex" = 0 ]; }; then
+    rm -f "$SNAP"
+    return
+  fi
+  SNAP_IDLE=$IDLE_SKIP
+  # 자리 비움으로 조회를 건너뛴 스냅샷은 캐시가 이미 낡았다. TTL 마다 전체 경로를
+  # 돌려 회전 판정만 이어가고, 빠른 경로는 사람이 돌아오는 즉시 풀린다.
+  if [ "$SNAP_IDLE" = 1 ]; then VALID_UNTIL=$(( NOW + TTL )); else VALID_UNTIL=$(( DATA_AT + TTL )); fi
+  # 토큰 회전 창에 들어가면 스냅샷을 끝내 전체 경로가 회전을 맡게 한다.
+  cap=$(( c_exp_s - ${TOKENHUD_CLAUDE_REFRESH_WINDOW:-900} ))
+  [ "$c_exp_s" -gt 0 ] 2>/dev/null && [ "$cap" -lt "$VALID_UNTIL" ] && VALID_UNTIL=$cap
+  if [ -n "$xexp" ] && [ "$xexp" -gt 0 ] 2>/dev/null; then
+    cap=$(( xexp - ${TOKENHUD_CODEX_REFRESH_WINDOW:-900} ))
+    [ "$cap" -lt "$VALID_UNTIL" ] && VALID_UNTIL=$cap
+  fi
+  {
+    for v in $SNAP_VARS; do
+      printf '%s=%q\n' "$v" "${!v}"
+    done
+  } > "$SNAP.tmp" && mv "$SNAP.tmp" "$SNAP"
+}
+
+# 동시에 두 개가 전체 경로를 돌면 같은 API 를 두 번 친다. 타이머 실행 중에
+# 워처의 refreshallplugins 나 메뉴 클릭이 겹치면 실제로 그렇게 된다(SwiftBar 는 이전
+# 실행을 취소해도 프로세스를 죽이지 않는다). 전체 경로는 한 번에 하나만 돈다.
+# 낙은 락 회수 기준 120초 = 회전 최대 45초 + 조회 8초 x 2 에 여유.
+RUN_LOCK="$CACHE_DIR/.run_lock"
+run_lock() {
+  local lm
+  mkdir "$RUN_LOCK" 2>/dev/null && return 0
+  lm=$(stat -f %m "$RUN_LOCK" 2>/dev/null || echo "$NOW")
+  [ $(( NOW - lm )) -ge 120 ] || return 1
+  rmdir "$RUN_LOCK" 2>/dev/null
+  mkdir "$RUN_LOCK" 2>/dev/null
+}
+
+FAST=0; ROUND_DUE=0
+if [ "$BUSTED" = 0 ] && [ ! -f "$BUST" ] && snapshot_load; then
+  # 자리 비움 스냅샷은 사람이 돌아오면 바로 버린다(밀린 조회를 즉시 하도록).
+  if [ "$NOW" -lt "$VALID_UNTIL" ] && { [ "$SNAP_IDLE" != 1 ] || user_idle; }; then
+    FAST=1
+  else
+    ROUND_DUE=1
+  fi
+fi
+if [ "$FAST" = 0 ]; then
+  if run_lock; then
+    trap 'rmdir "$RUN_LOCK" 2>/dev/null' EXIT
+  elif snapshot_load; then
+    # 다른 실행이 지금 조회 중이다. 중복 호출 대신 직전 값을 그린다.
+    # 강제 갱신을 소모했다면 돌려놓아 다음 실행이 이어받게 한다.
+    [ "$BUSTED" = 1 ] && touch "$BUST"
+    FAST=1
+  fi
 fi
 
-if [ -n "$x_json" ]; then
-  # 상대값(reset_after_seconds)은 캐시 중 계속 낡는다. 절대 reset_at을 사용한다.
-  now=$NOW
-  IFS='|' read -r x_plan x7_pct x7_at <<<"$(printf '%s' "$x_json" | jq -r '
-    ([.rate_limit.primary_window, .rate_limit.secondary_window]
-     | map(select(. != null and .limit_window_seconds > 21600))) as $w
-    | [(.plan_type // ""),
-       (if ($w|length)>0 then ($w[0].used_percent|tostring) else "" end),
-       (if ($w|length)>0 then ($w[0].reset_at|tostring) else "" end)]
-    | join("|")')"
-  [ -n "$x7_at" ] && [ "$x7_at" != "null" ] && x7_left=$(( ${x7_at%.*} - now ))
+if [ "$FAST" = 0 ]; then
+  snapshot_reset
+  fetch_claude
+  fetch_codex
+fi
+
+# 드롭다운에 적는 '언제 값인가'. 실행 시각이 아니라 서버에서 받은 시각이다.
+if [ "$FAST" = 0 ]; then
+  DATA_AT=$NOW
+  [ "$MT_claude" -gt 0 ] && [ "$MT_claude" -lt "$DATA_AT" ] && DATA_AT=$MT_claude
+  [ "$MT_codex" -gt 0 ] && [ "$MT_codex" -lt "$DATA_AT" ] && DATA_AT=$MT_codex
 fi
 
 # ── 메뉴바 타이틀 ─────────────────────────────────────────────────────
 # Claude 5시간/주간 + Codex 주간을 PNG 한 장으로 합성한다.
 # SwiftBar는 한 줄에 이미지 하나만 받을 수 있어 렌더러를 따로 둔다.
-worst() {
-  local a="${1%.*}" b="${2%.*}"
-  [ -z "$a" ] && a=-1; [ -z "$b" ] && b=-1
-  [ "$a" -ge "$b" ] 2>/dev/null && echo "$a" || echo "$b"
-}
-
 # "12.7" / "" / "null" -> 12 / -1 / -1
 # 렌더러엔 정수만 넘긴다(Swift 쪽 Int() 가 소수점을 못 먹고 그대로 -1 로 떨어진다).
-pctint() {
-  local v="${1%.*}"
-  { [ -z "$v" ] || [ "$v" = "null" ]; } && { echo -1; return; }
-  echo "$v"
+pctint_set() {   # pctint_set <변수명> <값>
+  local v="${2%.*}"
+  { [ -z "$v" ] || [ "$v" = "null" ]; } && v=-1
+  printf -v "$1" '%s' "$v"
 }
-c5=$(pctint "$c5_pct"); c7=$(pctint "$c7_pct"); x7=$(pctint "$x7_pct")
+pctint_set c5 "$c5_pct"; pctint_set c7 "$c7_pct"; pctint_set x7 "$x7_pct"
 
 # 아이콘 색은 표시하는 세 값 중 가장 급한 값을 따른다.
-top=$(worst "$(worst "$c5" "$c7")" "$x7")
+top=$c5
+[ "$c7" -gt "$top" ] 2>/dev/null && top=$c7
+[ "$x7" -gt "$top" ] 2>/dev/null && top=$x7
 # 값이 하나도 없으면 초록(안전)으로 오해시키지 않는다
 if   [ "$top" -lt 0 ] 2>/dev/null; then icon="⚪️"
 elif [ "$top" -ge 90 ]; then icon="🔴"
@@ -945,6 +1115,8 @@ esac
 # 토큰 본체가 빈 상태도 재로그인 외엔 복구가 없다.
 [ "$c_err" = "token-empty" ] && relogin=1
 
+[ "$FAST" = 0 ] && snapshot_save
+
 # 렌더러가 없을 때의 텍스트 폴백.
 fmt() { [ "$1" -lt 0 ] 2>/dev/null && echo "–" || echo "$1"; }
 emit_text_title() {
@@ -954,7 +1126,9 @@ emit_text_title() {
 # 에셋은 플러그인 폴더 바깥에 둔다.
 # SwiftBar 는 플러그인 폴더의 파일을 전부 실행하려 들기 때문에,
 # PNG/소스를 같은 폴더에 두면 NSTask 예외로 앱이 통째로 죽는다(실측).
-HUDIMG="${TOKENHUD_ASSETS:-$(cd "$(dirname "$0")/../assets" 2>/dev/null && pwd)}/hudimg"
+# SwiftBar 는 절대경로로 실행한다. 상대경로 실행도 문자열 조작만으로 풀린다(cd/dirname 스폰 없음).
+case "$0" in */*) PLUGIN_DIR="${0%/*}";; *) PLUGIN_DIR=.;; esac
+HUDIMG="${TOKENHUD_ASSETS:-$PLUGIN_DIR/../assets}/hudimg"
 # 메뉴바는 항상 컬러로 그린다.
 if [ "${TOKENHUD_ICON:-logo}" = "logo" ] && [ -x "$HUDIMG" ]; then
   tkey="$c5/$c7/$x7/$stale"
@@ -983,15 +1157,12 @@ echo "---"
 
 # ── 드롭다운 ──────────────────────────────────────────────────────────
 # 헤더 로고도 값이 안 변하니 base64 를 파일로 캐싱해 재사용한다.
-logo_b64() {
-  local n="$1" f="$CACHE_DIR/logo-${1}.b64"
-  if [ ! -s "$f" ] && [ -x "$HUDIMG" ]; then
-    "$HUDIMG" --logo "$n" 12 > "$f" 2>/dev/null
-  fi
-  [ -s "$f" ] && printf "%s" "$(<"$f")"
-}
 header() {   # header <로고이름> <텍스트>
-  local b; b=$(logo_b64 "$1")
+  local f="$CACHE_DIR/logo-${1}.b64" b=""
+  if [ ! -s "$f" ] && [ -x "$HUDIMG" ]; then
+    "$HUDIMG" --logo "$1" 12 > "$f" 2>/dev/null
+  fi
+  [ -s "$f" ] && IFS= read -r b < "$f"
   if [ -n "$b" ]; then
     echo "$2 | $FONT color=$C_DIM image=$b"
   else
@@ -1054,6 +1225,8 @@ else
   fi
   [ -n "$c_refresh_err" ] && \
     echo "  ⚠︎ $(why "$c_refresh_err" "" claude) | $FONT color=$C_WARN"
+  c5_left=""; [ -n "$c5_e" ] && c5_left=$(( c5_e - NOW ))
+  c7_left=""; [ -n "$c7_e" ] && c7_left=$(( c7_e - NOW ))
   row "5시간" "$c5_pct" "$c5_left" "$WIN_5H"
   row "주간"  "$c7_pct" "$c7_left" "$WIN_7D"
   # 모델별 주간 한도(limits 배열). 서버가 주는 이름을 그대로 쓴다.
@@ -1061,7 +1234,7 @@ else
     while IFS='|' read -r s_name s_pct s_at; do
       [ -n "$s_name" ] || continue
       s_left=""
-      e=$(iso_to_epoch "$s_at"); [ -n "$e" ] && s_left=$((e - NOW))
+      iso_epoch_set "$s_at"; [ -n "$EPOCH" ] && s_left=$(( EPOCH - NOW ))
       row "$s_name" "$s_pct" "$s_left" "$WIN_7D"
     done <<<"$c_scoped"
   fi
@@ -1097,6 +1270,7 @@ else
     echo "  ⚠︎ $(cache_age codex) 전 값 · $(why "$x_err" "토큰 만료 — 자동 갱신 재시도 중") | $FONT color=$C_WARN"
   [ -n "$x_refresh_err" ] && \
     echo "  ⚠︎ $(why "$x_refresh_err") | $FONT color=$C_WARN"
+  x7_left=""; [ -n "$x7_e" ] && x7_left=$(( x7_e - NOW ))
   row "주간" "$x7_pct" "$x7_left" "$WIN_7D"
   pace_warn_flush
 fi
@@ -1109,10 +1283,10 @@ echo "새로고침 | refresh=true"
 echo "지금 강제 갱신 | bash=/usr/bin/touch param1=$BUST terminal=false refresh=true"
 [ -n "$relogin" ] && \
   echo "Claude 재로그인 | bash=/opt/homebrew/bin/claude param1=auth param2=login terminal=true refresh=true"
-# 시각은 위에서 구한 NOW 를 그대로 포맷한다(date 스폰 1회 절약 · 표시 기준시각도 일치).
-stamp=$(date -r "$NOW" '+%H:%M:%S')
-if [ -n "$c_err$x_err$x_refresh_err" ]; then
-  echo "업데이트 $stamp  ·  캐시 사용중 | $SMALL color=$C_WARN"
+# 서버 값을 받은 시각을 보여준다(실행 시각을 찍으면 캐시가 낙아도 방금 받은 것처럼 보인다).
+clock_set "$DATA_AT"
+if [ -n "$c_err$x_refresh_err" ] || { [ -n "$x_err" ] && [ "$x_err" != "not-installed" ]; }; then
+  echo "업데이트 $CLOCK  ·  캐시 사용중 | $SMALL color=$C_WARN"
 else
-  echo "업데이트 $stamp  ·  ${TTL}초마다 조회 | $SMALL color=$C_DIM"
+  echo "업데이트 $CLOCK  ·  ${TTL}초마다 조회 | $SMALL color=$C_DIM"
 fi
